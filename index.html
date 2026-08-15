@@ -88,6 +88,8 @@ let mode='pvp', aiColor=W, aiLevel=1, thinking=false, engine='heuristic';
 let moveLog=[]; // gnugo 模式下的真实落子序列 [x(col),y(row),color]，用于回放
 let gnugoReady=false, gnugoLoading=false, gnugoFailed=false, gnugoWaiters=[];
 let gameId=0; // 防止异步 AI 回调时用户已新开对局
+let lastMove=null; // 最近一手 [x,y]，用于闪烁高亮
+let rafId=null;     // 闪烁动画循环句柄
 const canvas=document.getElementById('board');
 const ctx=canvas.getContext('2d');
 const res=document.getElementById('res');
@@ -113,8 +115,9 @@ function newGame(){
   for(const [x,y] of handiPoints(handi)) board[x][y]=B;
   // 黑方先手是围棋基本规则：分先黑先；让子局白先（让子摆黑）
   cur = handi>0 ? W : B;
-  ko=null; history=[]; caps={1:0,2:0}; passes=0; scored=false; terr=null; thinking=false; started=false;
+  ko=null; history=[]; caps={1:0,2:0}; passes=0;   scored=false; terr=null; thinking=false; started=false;
   res.textContent='';
+  lastMove=null;
   afterMove();
 }
 
@@ -122,6 +125,7 @@ function startGame(){
   if(thinking || started || scored) return;
   started=true;
   res.textContent='';
+  lastMove=null;
   afterMove(); // 若电脑执黑，会立即自动落子
 }
 
@@ -178,6 +182,7 @@ function tryPlace(x,y){
   if(mode==='ai' && engine==='gnugo') moveLog.push([x,y,cur]);
   history.push({board:board.map(r=>r.slice()), cur, ko:ko?ko.slice():null, caps:{...caps}, passes, mll:moveLog.length});
   cur=opp; passes=0;
+  lastMove=[x,y]; scheduleFlash();
   afterMove();
 }
 
@@ -195,6 +200,7 @@ function undo(){
   }
   scored=false; terr=null; thinking=false;
   res.textContent='';
+  lastMove=null;
   afterMove();
 }
 
@@ -204,6 +210,7 @@ function pass(){
   passes++;
   if(passes>=2){ doScore(); return; }
   cur = cur===B ? W : B;
+  lastMove=null;
   afterMove();
 }
 
@@ -763,6 +770,7 @@ function gnugoPass(){
 function doScore(){
   if(thinking || !started) return;
   scored=true;
+  lastMove=null;
   terr=Array.from({length:size},()=>Array(size).fill(0));
   let tB=0,tW=0,neu=0;
   const seen=Array.from({length:size},()=>Array(size).fill(false));
@@ -837,6 +845,29 @@ function draw(){
     else { g.addColorStop(0,'#fff'); g.addColorStop(1,'#cfcfcf'); }
     ctx.fillStyle=g; ctx.beginPath(); ctx.arc(px,py,r,0,7); ctx.fill();
   }
+  // 最近一手闪烁高亮（红环 + 中心点），让玩家看清刚下在哪
+  if(lastMove && !scored && inBoard(lastMove[0],lastMove[1]) && board[lastMove[0]][lastMove[1]]!==0){
+    const [lx,ly]=lastMove;
+    const px=pad+lx*grid, py=pad+ly*grid, r=grid*0.46;
+    const t=(Math.sin(performance.now()/220)+1)/2; // 0..1 呼吸闪烁
+    ctx.save();
+    ctx.lineWidth=2+2.5*t;
+    ctx.strokeStyle='rgba(255,64,64,'+(0.45+0.5*t)+')';
+    ctx.beginPath(); ctx.arc(px,py, r+3+2*t, 0, 7); ctx.stroke();
+    ctx.fillStyle='rgba(255,64,64,'+(0.6+0.4*t)+')';
+    ctx.beginPath(); ctx.arc(px,py, grid*0.12, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+}
+
+function scheduleFlash(){
+  if(rafId!==null) return;
+  const tick=()=>{
+    rafId=null;
+    draw();
+    if(lastMove && !scored){ rafId=requestAnimationFrame(tick); }
+  };
+  rafId=requestAnimationFrame(tick);
 }
 
 function syncModeUI(){
