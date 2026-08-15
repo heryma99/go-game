@@ -53,6 +53,7 @@ canvas{background:#e8b974;border-radius:6px;box-shadow:0 6px 24px #0008;touch-ac
       <option value="8">8</option><option value="9">9</option>
     </select>
   </label>
+  <button id="start">▶ 开始对局</button>
   <button id="new">新对局</button>
   <button id="undo">悔棋</button>
   <button id="pass">停一手</button>
@@ -66,10 +67,10 @@ canvas{background:#e8b974;border-radius:6px;box-shadow:0 6px 24px #0008;touch-ac
 </div>
 <canvas id="board"></canvas>
 <div id="res"></div>
-<div class="hint">点击交叉点落子 · 自动提子 / 禁着 / 打劫 · 人机模式电脑自动应手 · 双方各停一手即终局数子</div>
+<div class="hint">点击「开始对局」开局（黑方先手）· 自动提子 / 禁着 / 打劫 · 人机模式电脑自动应手 · 双方各停一手即终局数子</div>
 <script>
 const B=1, W=2;
-let size=19, board, cur, ko, history, caps, passes, handi, scored, terr;
+let size=19, board, cur, ko, history, caps, passes, handi, scored, terr, started;
 let mode='pvp', aiColor=W, thinking=false;
 const canvas=document.getElementById('board');
 const ctx=canvas.getContext('2d');
@@ -90,12 +91,18 @@ function newGame(){
   aiColor = document.getElementById('aiSide').value==='W' ? W : B;
   board=Array.from({length:size},()=>Array(size).fill(0));
   for(const [x,y] of handiPoints(handi)) board[x][y]=B;
-  cur = (mode==='ai') ? (handi>0 ? W : B) : (handi>0 ? W : B);
-  // 人机分先默认玩家执黑先；让子则玩家执白后行
-  if(mode==='ai' && handi===0) cur = (aiColor===W) ? B : W;
-  ko=null; history=[]; caps={1:0,2:0}; passes=0; scored=false; terr=null; thinking=false;
+  // 黑方先手是围棋基本规则：分先黑先；让子局白先（让子摆黑）
+  cur = handi>0 ? W : B;
+  ko=null; history=[]; caps={1:0,2:0}; passes=0; scored=false; terr=null; thinking=false; started=false;
   res.textContent='';
   afterMove();
+}
+
+function startGame(){
+  if(started || scored) return;
+  started=true;
+  res.textContent='';
+  afterMove(); // 若电脑执黑，会立即自动落子
 }
 
 function neighbors(x,y){
@@ -153,7 +160,7 @@ function tryPlace(x,y){
 }
 
 function undo(){
-  if(!history.length) return;
+  if(!history.length || !started) return;
   let s=history.pop();
   board=s.board.map(r=>r.slice()); cur=s.cur; ko=s.ko?s.ko.slice():null; caps={...s.caps}; passes=s.passes;
   if(mode==='ai'){
@@ -169,7 +176,7 @@ function undo(){
 }
 
 function pass(){
-  if(scored) return;
+  if(scored || !started) return;
   history.push({board:board.map(r=>r.slice()), cur, ko:ko?ko.slice():null, caps:{...caps}, passes});
   passes++;
   if(passes>=2){ doScore(); return; }
@@ -179,18 +186,25 @@ function pass(){
 
 function afterMove(){
   draw(); updateStatus();
-  if(mode==='ai' && !scored && cur===aiColor){
+  if(mode==='ai' && started && !scored && cur===aiColor){
+    res.textContent='电脑思考中…';
     setTimeout(aiMove, 450);
+  } else if(started){
+    res.textContent='';
   }
 }
 
 function updateStatus(){
   document.getElementById('capB').textContent=caps[B];
   document.getElementById('capW').textContent=caps[W];
-  document.getElementById('turn').textContent=cur===B?'黑':'白';
+  document.getElementById('turn').textContent = started ? (cur===B?'黑':'白') : '—';
   document.getElementById('modeLabel').textContent = mode==='ai'
     ? ('· 人机（电脑执'+(aiColor===B?'黑':'白')+'）')
     : '· 人人对弈';
+  document.getElementById('start').disabled = started;
+  if(!started && !scored){
+    res.textContent='就绪 · 点击「开始对局」（黑方先手）';
+  }
 }
 
 function totalStones(){ let n=0; for(let x=0;x<size;x++)for(let y=0;y<size;y++) if(board[x][y]!==0) n++; return n; }
@@ -250,7 +264,7 @@ function aiBest(){
 }
 
 function aiMove(){
-  if(mode!=='ai' || scored || thinking || cur!==aiColor) return;
+  if(mode!=='ai' || scored || thinking || cur!==aiColor || !started) return;
   thinking=true;
   const {best,bs}=aiBest();
   thinking=false;
@@ -259,6 +273,7 @@ function aiMove(){
 }
 
 function doScore(){
+  if(!started) return;
   scored=true;
   terr=Array.from({length:size},()=>Array(size).fill(0));
   let tB=0,tW=0,neu=0;
@@ -342,6 +357,7 @@ function syncModeUI(){
 }
 
 canvas.addEventListener('click', e=>{
+  if(!started || scored) return;
   if(mode==='ai' && cur===aiColor) return; // 电脑回合，不响应点击
   const rect=canvas.getBoundingClientRect();
   const cw=getCw();
@@ -357,12 +373,15 @@ canvas.addEventListener('click', e=>{
   tryPlace(x,y);
 });
 
+document.getElementById('start').onclick=startGame;
 document.getElementById('new').onclick=newGame;
 document.getElementById('undo').onclick=undo;
 document.getElementById('pass').onclick=pass;
 document.getElementById('score').onclick=doScore;
 document.getElementById('mode').onchange=()=>{ syncModeUI(); newGame(); };
 document.getElementById('aiSide').onchange=newGame;
+document.getElementById('size').onchange=newGame;
+document.getElementById('handi').onchange=newGame;
 window.addEventListener('resize', draw);
 syncModeUI();
 newGame();
