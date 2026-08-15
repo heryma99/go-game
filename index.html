@@ -44,6 +44,12 @@ canvas{background:#e8b974;border-radius:6px;box-shadow:0 6px 24px #0008;touch-ac
       <option value="2">困难</option>
     </select>
   </label>
+  <label id="engineWrap" style="display:none">引擎
+    <select id="engine">
+      <option value="heuristic">启发式</option>
+      <option value="gnugo">GNU Go（强）</option>
+    </select>
+  </label>
   <label>路数
     <select id="size">
       <option value="9">9 路</option>
@@ -74,11 +80,13 @@ canvas{background:#e8b974;border-radius:6px;box-shadow:0 6px 24px #0008;touch-ac
 </div>
 <canvas id="board"></canvas>
 <div id="res"></div>
-<div class="hint">点击「开始对局」开局（黑方先手）· 自动提子 / 禁着 / 打劫 · 人机模式电脑自动应手 · 双方各停一手即终局数子</div>
+<div class="hint">点击「开始对局」开局（黑方先手）· 自动提子 / 禁着 / 打劫 · 人机可选 GNU Go 引擎（接近业余强段，首次需联网下载约 8MB）· 双方各停一手即终局数子</div>
 <script>
 const B=1, W=2;
 let size=19, board, cur, ko, history, caps, passes, handi, scored, terr, started;
-let mode='pvp', aiColor=W, aiLevel=1, thinking=false;
+let mode='pvp', aiColor=W, aiLevel=1, thinking=false, engine='heuristic';
+let moveLog=[]; // gnugo 模式下的真实落子序列 [x(col),y(row),color]，用于回放
+let gnugoReady=false, gnugoLoading=false, gnugoFailed=false, gnugoWaiters=[];
 const canvas=document.getElementById('board');
 const ctx=canvas.getContext('2d');
 const res=document.getElementById('res');
@@ -97,6 +105,8 @@ function newGame(){
   mode=document.getElementById('mode').value;
   aiColor = document.getElementById('aiSide').value==='W' ? W : B;
   aiLevel = parseInt(document.getElementById('aiLevel').value || '1');
+  engine = (mode==='ai') ? document.getElementById('engine').value : 'heuristic';
+  moveLog=[];
   board=Array.from({length:size},()=>Array(size).fill(0));
   for(const [x,y] of handiPoints(handi)) board[x][y]=B;
   // 黑方先手是围棋基本规则：分先黑先；让子局白先（让子摆黑）
@@ -163,7 +173,8 @@ function tryPlace(x,y){
   if(removed.length===1 && myg.libs===1) ko=[removed[0][0],removed[0][1]];
   else ko=null;
   caps[cur]+=removed.length;
-  history.push({board:board.map(r=>r.slice()), cur, ko:ko?ko.slice():null, caps:{...caps}, passes});
+  if(mode==='ai' && engine==='gnugo') moveLog.push([x,y,cur]);
+  history.push({board:board.map(r=>r.slice()), cur, ko:ko?ko.slice():null, caps:{...caps}, passes, mll:moveLog.length});
   cur=opp; passes=0;
   afterMove();
 }
@@ -178,6 +189,7 @@ function undo(){
       s=history.pop();
       board=s.board.map(r=>r.slice()); cur=s.cur; ko=s.ko?s.ko.slice():null; caps={...s.caps}; passes=s.passes;
     }
+    if(engine==='gnugo') moveLog.length = s.mll; // 保持棋谱与棋盘一致
   }
   scored=false; terr=null; thinking=false;
   res.textContent='';
@@ -186,7 +198,7 @@ function undo(){
 
 function pass(){
   if(scored || !started) return;
-  history.push({board:board.map(r=>r.slice()), cur, ko:ko?ko.slice():null, caps:{...caps}, passes});
+  history.push({board:board.map(r=>r.slice()), cur, ko:ko?ko.slice():null, caps:{...caps}, passes, mll:moveLog.length});
   passes++;
   if(passes>=2){ doScore(); return; }
   cur = cur===B ? W : B;
@@ -197,8 +209,9 @@ function afterMove(){
   draw(); updateStatus();
   if(mode==='ai' && started && !scored && cur===aiColor){
     res.textContent='电脑思考中…';
-    const delay = aiLevel===2 ? 700 : 450;
-    setTimeout(aiMove, delay);
+    const fn = engine==='gnugo' ? gnugoComputerMove : aiMove;
+    const delay = engine==='gnugo' ? 550 : (aiLevel===2 ? 700 : 450);
+    setTimeout(fn, delay);
   } else if(started){
     res.textContent='';
   }
@@ -612,7 +625,7 @@ function aiBestHard(){
 }
 
 function aiMove(){
-  if(mode!=='ai' || scored || thinking || cur!==aiColor || !started) return;
+  if(mode!=='ai' || engine==='gnugo' || scored || thinking || cur!==aiColor || !started) return;
   thinking=true;
   let r;
   if(aiLevel===0) r=aiBestEasy();
@@ -621,6 +634,79 @@ function aiMove(){
   thinking=false;
   if(r.best && r.bs>-600) tryPlace(r.best[0],r.best[1]);
   else pass();
+}
+
+// ========== GNU Go 引擎（强业余~初段，纯前端 WASM） ==========
+// 设计：GNU Go 仅作"走子建议器"——每回合重新初始化并回放我们的棋谱，
+// 让它为电脑方算出一手坐标；棋盘真相/提子/打劫/停一手/悔棋/数子仍用本页规则引擎。
+function komiVal(){ return handi>0 ? 0 : (size>=13 ? 7.5 : 5.5); }
+
+function loadGnuGo(cb){
+  if(gnugoReady){ cb&&cb(true); return; }
+  if(gnugoFailed){ cb&&cb(false); return; }
+  gnugoWaiters.push(cb);
+  if(gnugoLoading) return;
+  gnugoLoading=true;
+  res.textContent='正在加载 GNU Go 引擎（约 8MB，首次需联网）…';
+  window.Module = window.Module || {};
+  window.Module.onRuntimeInitialized = function(){
+    gnugoReady=true; gnugoLoading=false;
+    const ws=gnugoWaiters; gnugoWaiters=[];
+    ws.forEach(f=>f&&f(true));
+  };
+  const s=document.createElement('script');
+  s.src='./gnugo.js';
+  s.onerror=()=>{
+    gnugoLoading=false; gnugoFailed=true;
+    res.textContent='⚠️ GNU Go 引擎加载失败（需联网下载约 8MB），已自动切回启发式 AI。';
+    const ws=gnugoWaiters; gnugoWaiters=[]; ws.forEach(f=>f&&f(false));
+  };
+  document.body.appendChild(s);
+}
+
+// 让 GNU Go 为 color 方给出一手坐标；返回 [x,y] 或 null（停一手）
+function gnugoSuggest(color){
+  if(!gnugoReady) return null;
+  Module._initializeGoGame(size, komiVal(), handi, 1);
+  for(const [x,y] of moveLog){
+    // 我们的 (x=列,y=行) 对应 GNU Go 的 (row=y, col=x)
+    const rr = Module._moveTo(y, x);
+    if(rr!==0){ // 规则差异导致回放失败 -> 退回启发式
+      const fb = aiLevel===0?aiBestEasy():aiLevel===1?aiBestMedium():aiBestHard();
+      return fb.best;
+    }
+  }
+  // 推算当前 to_move：init=(handi>0?W:B)，每手翻转
+  let toMove = handi>0 ? W : B;
+  for(let i=0;i<moveLog.length;i++) toMove = (toMove===B?W:B);
+  if(toMove !== color){ Module._genNextStep(); } // 借一手翻转 to_move（结果丢弃）
+  Module._genNextStep(); // 真正为 color 生成应手
+  for(let x=0;x<size;x++)for(let y=0;y<size;y++){
+    if(Module._isLastMove(y, x)) return [x,y]; // (row=y,col=x) -> 我们 (x,y)
+  }
+  return null; // GNU Go 选择停一手
+}
+
+function gnugoComputerMove(){
+  if(mode!=='ai' || engine!=='gnugo' || scored || cur!==aiColor || !started) return;
+  if(gnugoFailed){ aiMove(); return; }
+  if(!gnugoReady){ loadGnuGo(ok=>{ if(ok) gnugoComputerMove(); else aiMove(); }); return; }
+  const sug = gnugoSuggest(aiColor);
+  if(!sug){ gnugoPass(); return; }
+  const bx=sug[0], by=sug[1];
+  tryPlace(bx, by);
+  if(board[bx][by]!==aiColor){ // 罕见：建议手被本页规则拒（如劫），退回启发式
+    const r=aiLevel===0?aiBestEasy():aiLevel===1?aiBestMedium():aiBestHard();
+    if(r.best) tryPlace(r.best[0],r.best[1]); else pass();
+  }
+}
+
+function gnugoPass(){
+  passes++;
+  if(passes>=2){ doScore(); return; }
+  cur=(cur===B?W:B);
+  res.textContent='电脑停一手';
+  afterMove();
 }
 
 function doScore(){
@@ -649,7 +735,7 @@ function doScore(){
     if(board[x][y]===B)cB++; else if(board[x][y]===W)cW++;
   }
   const black=cB+tB, white=cW+tW;
-  const komi = handi>0 ? 0 : 3.75;
+  const komi = komiVal();
   const bAdj = black - komi;
   let msg;
   if(bAdj>white) msg=`黑胜 ${(bAdj-white).toFixed(2)} 子`;
@@ -706,6 +792,7 @@ function syncModeUI(){
   const isAi = document.getElementById('mode').value==='ai';
   document.getElementById('aiSideWrap').style.display = isAi ? 'inline' : 'none';
   document.getElementById('aiLevelWrap').style.display = isAi ? 'inline' : 'none';
+  document.getElementById('engineWrap').style.display = isAi ? 'inline' : 'none';
 }
 
 canvas.addEventListener('click', e=>{
@@ -733,6 +820,11 @@ document.getElementById('score').onclick=doScore;
 document.getElementById('mode').onchange=()=>{ syncModeUI(); newGame(); };
 document.getElementById('aiSide').onchange=newGame;
 document.getElementById('aiLevel').onchange=newGame;
+document.getElementById('engine').onchange=()=>{
+  syncModeUI();
+  if(document.getElementById('engine').value==='gnugo') loadGnuGo();
+  newGame();
+};
 document.getElementById('size').onchange=newGame;
 document.getElementById('handi').onchange=newGame;
 window.addEventListener('resize', draw);
