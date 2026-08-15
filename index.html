@@ -587,9 +587,23 @@ function aiBestMedium(){
 function aiBestHard(){
   const opp=aiColor===B?W:B;
   const saves=defenseMoves(board, aiColor);
+  const fillRatio=totalStones()/(size*size); // 终局判定
   const cands=[];
   for(let x=0;x<size;x++)for(let y=0;y<size;y++){
-    const s=evalPoint(x,y,aiColor) + (saves.get(x+','+y)||0);
+    if(!isLegalOnBoard(board,ko,x,y,aiColor)) continue;
+    if(isOwnEye(x,y,aiColor)) continue; // 不填自己的眼
+    let s=evalPoint(x,y,aiColor) + (saves.get(x+','+y)||0);
+    if(fillRatio>0.5){
+      // 终局：偏好填单官(dame)/收官，远离棋子的确定地不填，避免"乱下"
+      let adjB=0,adjW=0,adjE=0;
+      for(const [nx,ny] of neighbors(x,y)){
+        if(board[nx][ny]===B) adjB++; else if(board[nx][ny]===W) adjW++; else adjE++;
+      }
+      if(adjB>0 && adjW>0) s += 300;       // 填双方都挨着的单官，最高优先
+      else if(adjW>0 && adjB===0) s += 90;  // 进对方空收官
+      else if(adjB>0 && adjE>0) s += 40;    // 连自己空边
+      else s -= 120;                         // 远离棋子的空点（多已确定地，不必填）
+    }
     if(s>-1e8) cands.push({x,y,s});
   }
   cands.sort((a,b)=>b.s-a.s);
@@ -735,27 +749,75 @@ function gnugoSuggest(color){
   return workerCall('suggest', {size, komi:komiVal(), handi, moveLog, color});
 }
 
+// 终局/残局：找一个"安全且有价值"的着法——填单官(dame)、进对方空收官、提子；
+// 绝不走 self-atari（送吃）或填自己的眼。返回 [x,y] 或 null（无安全点）。
+function dameFillMove(){
+  const opp=aiColor===B?W:B;
+  let best=null, bestS=-1e9;
+  for(let x=0;x<size;x++)for(let y=0;y<size;y++){
+    if(board[x][y]!==0) continue;
+    if(ko && ko[0]===x && ko[1]===y) continue;
+    if(isOwnEye(x,y,aiColor)) continue;
+    const r=placeOnBoard(board,ko,x,y,aiColor);
+    if(!r) continue;
+    const cap=r.removed.length;
+    const g=getGroupOnBoard(r.bd,x,y);
+    if(g.libs===0 && cap===0) continue;   // 自杀禁着
+    if(g.libs<=1 && cap===0) continue;    // self-atari 送吃，跳过
+    let adjB=0,adjW=0,adjE=0;
+    for(const [nx,ny] of neighbors(x,y)){
+      if(board[nx][ny]===B) adjB++; else if(board[nx][ny]===W) adjW++; else adjE++;
+    }
+    let s = cap*1000 + g.libs*3;
+    if(adjB>0 && adjW>0) s += 200;       // 填单官（双方都挨着的空），最优先
+    else if(adjW>0 && adjB===0) s += 60; // 进对方空收官
+    else if(adjB>0 && adjE>0) s += 25;   // 连自己空边
+    else s -= 50;                         // 远离棋子的确定地，不必填
+    if(s>bestS){ bestS=s; best=[x,y]; }
+  }
+  return best;
+}
+
+// GNU Go 本次不可用时的兜底：仅本手用强启发式顶替，下一手仍重试 GNU Go（不永久切换引擎）
+function heuristicFallbackMove(){
+  let mv, bs=-Infinity;
+  if(aiLevel===2){ const r=aiBestHard(); mv=r.best; bs=r.bs; }
+  else if(aiLevel===1){ const r=aiBestMedium(); mv=r.best; bs=r.bs; }
+  else { const r=aiBestEasy(); mv=r.best; bs=r.bs; }
+  const dame=dameFillMove();
+  if((!mv || bs<=-600) && dame){ mv=dame; bs=1; }
+  if(mv) tryPlace(mv[0],mv[1]);
+  else pass();
+}
+
 async function gnugoComputerMove(){
   if(mode!=='ai' || engine!=='gnugo' || scored || cur!==aiColor || !started) return;
-  if(gnugoFailed){ aiMove(); return; }
-  if(!gnugoReady){ loadGnuGo(ok=>{ if(ok) gnugoComputerMove(); else aiMove(); }); return; }
+  if(gnugoFailed){ heuristicFallbackMove(); return; }
+  if(!gnugoReady){ loadGnuGo(ok=>{ if(ok) gnugoComputerMove(); else heuristicFallbackMove(); }); return; }
   const thisGame = gameId;
   thinking=true;
   const sug = await gnugoSuggest(aiColor);
   thinking=false;
   if(thisGame!==gameId || !started || scored) return; // 等待期间用户可能新开了对局
   if(sug.error || sug.fallback){
-    engine='heuristic';
-    res.textContent='⚠️ GNU Go 出错，已临时切回启发式 AI。';
-    aiMove(); return;
+    // 仅本手用启发式顶替，下一手继续尝试 GNU Go（不再永久切走导致整盘乱下）
+    heuristicFallbackMove(); return;
   }
-  if(sug.pass){ gnugoPass(); return; }
+  if(sug.pass){
+    // GNU Go 想停：若还有单官(dame)可安全填，则继续填，避免过早终局/浪费手数
+    const dame=dameFillMove();
+    if(dame){ tryPlace(dame[0],dame[1]); }
+    else { gnugoPass(); }
+    return;
+  }
   const bx=sug.x, by=sug.y;
-  if(bx==null || by==null){ gnugoPass(); return; }
+  if(bx==null || by==null){
+    const d=dameFillMove(); if(d) tryPlace(d[0],d[1]); else gnugoPass();
+    return;
+  }
   tryPlace(bx, by);
-  if(board[bx][by]!==aiColor){ // 罕见：建议手被本页规则拒（如劫），退回启发式
-    const r=aiLevel===0?aiBestEasy():aiLevel===1?aiBestMedium():aiBestHard();
-    if(r.best) tryPlace(r.best[0],r.best[1]); else pass();
+  if(board[bx][by]!==aiColor){ // 罕见：建议手被本页规则拒（如劫），退回安全填子
+    const d=dameFillMove(); if(d) tryPlace(d[0],d[1]); else pass();
   }
 }
 
