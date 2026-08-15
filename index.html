@@ -233,8 +233,154 @@ function isOwnEyeOnBoard(bd,x,y,color){
 }
 function isOwnEye(x,y,color){ return isOwnEyeOnBoard(board,x,y,color); }
 
+// ========== 经典围棋案例库（定式 / 好形 / 愚形 / 方向） ==========
+const JOSEKI = {
+  // 星位相关定式：黑占星位后，白挂角、黑守角/夹攻的经典应手
+  hoshi: {
+    // 黑先占星位（4,4 等角部星位）
+    corners: (sz)=>{
+      if(sz===19) return [[3,3],[15,3],[3,15],[15,15]];
+      if(sz===13) return [[3,3],[9,3],[3,9],[9,9]];
+      return [[2,2],[6,2],[2,6],[6,6]];
+    },
+    // 小飞挂角相对星位：挂点在 (dx+1, dy+2) 或其旋转
+    keimaMoves: (x,y)=> [[x+1,y+2],[x+2,y+1],[x-1,y+2],[x+2,y-1],[x-1,y-2],[x-2,y+1],[x+1,y-2],[x-2,y-1]],
+    // 星位守角/应法：小飞、一间跳、尖顶
+    replies: (x,y)=> [[x+2,y+1],[x+1,y+2],[x+2,y+2],[x+3,y+1],[x+1,y+3],[x+1,y+1]]
+  }
+};
+
+function inBoard(x,y){ return x>=0 && y>=0 && x<size && y<size; }
+
+// 判断 (x,y) 是否在某条边上
+function edgeDist(x,y){ return Math.min(x, y, size-1-x, size-1-y); }
+
+// 检查落子后是否形成愚形：空三角、方四、丁四、二路柱子等
+function badShapePenalty(bd,x,y,color){
+  let pen=0;
+  // 空三角：三个同色子呈 L 且无对方棋子贴住拐角
+  const lshapes=[
+    [[1,0],[0,1],[1,1]], [[1,0],[0,-1],[1,-1]],
+    [[-1,0],[0,1],[-1,1]], [[-1,0],[0,-1],[-1,-1]]
+  ];
+  for(const pts of lshapes){
+    const ax=x+pts[0][0], ay=y+pts[0][1];
+    const bx=x+pts[1][0], by=y+pts[1][1];
+    const cx=x+pts[2][0], cy=y+pts[2][1];
+    if(inBoard(ax,ay) && inBoard(bx,by) && inBoard(cx,cy) &&
+       bd[ax][ay]===color && bd[bx][by]===color && bd[cx][cy]===color){
+      pen += 35; // 空三角
+    }
+  }
+  // 二路爬行惩罚：落子位于二线，且同方向（上下左右）相邻或隔一格还有同色子
+  if(edgeDist(x,y)===1){
+    for(const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+      const nx=x+dx, ny=y+dy;
+      if(inBoard(nx,ny) && bd[nx][ny]===color && edgeDist(nx,ny)===1) pen += 40;
+    }
+    pen += 20; // 二线本身就不如三线四线舒展
+  }
+  // 三线是黄金线，奖励
+  if(edgeDist(x,y)===2) pen -= 8;
+  // 四线奖励
+  if(edgeDist(x,y)===3) pen -= 5;
+  return pen;
+}
+
+// 好形奖励：小尖、跳、飞、拆二、虎
+function goodShapeBonus(bd,x,y,color){
+  let bonus=0;
+  // 小尖（对角相邻）
+  for(const [dx,dy] of [[1,1],[1,-1],[-1,1],[-1,-1]]){
+    const nx=x+dx, ny=y+dy;
+    if(inBoard(nx,ny) && bd[nx][ny]===color) bonus += 10;
+  }
+  // 跳 / 拆二
+  for(const [dx,dy] of [[2,0],[-2,0],[0,2],[0,-2]]){
+    const nx=x+dx, ny=y+dy;
+    if(inBoard(nx,ny) && bd[nx][ny]===color) bonus += 14;
+  }
+  // 小飞
+  for(const [dx,dy] of [[2,1],[2,-1],[-2,1],[-2,-1],[1,2],[1,-2],[-1,2],[-1,-2]]){
+    const nx=x+dx, ny=y+dy;
+    if(inBoard(nx,ny) && bd[nx][ny]===color) bonus += 9;
+  }
+  // 大飞
+  for(const [dx,dy] of [[3,1],[3,-1],[-3,1],[-3,-1],[1,3],[1,-3],[-1,3],[-1,-3]]){
+    const nx=x+dx, ny=y+dy;
+    if(inBoard(nx,ny) && bd[nx][ny]===color) bonus += 5;
+  }
+  // 连接/补强自己弱子：附近有自己 1 气棋子时，这手有额外价值
+  for(const [nx,ny] of neighbors(x,y)){
+    if(bd[nx][ny]===color){
+      const g=getGroupOnBoard(bd,nx,ny);
+      if(g.libs<=2) bonus += 18;
+    }
+  }
+  return bonus;
+}
+
+// 方向与厚势：鼓励往中腹、棋盘中央发展；避免全挤在角上
+function directionBonus(bd,x,y,color){
+  const opp=color===B?W:B;
+  const cx=(size-1)/2, cy=(size-1)/2;
+  const toCenter = 1 - (Math.abs(x-cx)+Math.abs(y-cy))/(size-1);
+  let bonus = toCenter * 8; // 略往中腹偏
+  // 如果这手能堵住对方往中腹的出头，额外加分（封锁）
+  for(const [nx,ny] of neighbors(x,y)){
+    if(bd[nx][ny]===opp){
+      const g=getGroupOnBoard(bd,nx,ny);
+      if(g.libs<=3){
+        // 对方这块棋往中腹方向的气
+        for(const [gx,gy] of g.group){
+          for(const [ex,ey] of neighbors(gx,gy)){
+            if(bd[ex][ey]===0 && edgeDist(ex,ey)>edgeDist(gx,gy)) bonus += 6;
+          }
+        }
+      }
+    }
+  }
+  return bonus;
+}
+
+// 开局定式提示：前 30 手左右按经典占角/挂角/守角给候选点加权
+function josekiHint(bd,x,y,color){
+  const stones=totalStonesOnBoard(bd);
+  if(stones>size*1.6) return 0; // 中盘后不再靠定式
+  let h=0;
+  const opp=color===B?W:B;
+  const hoshiPts = JOSEKI.hoshi.corners(size);
+  // 自己还没占角，优先占三三/星位/小目
+  const myCorner = hoshiPts.some(([cx,cy])=>bd[cx][cy]===color);
+  if(!myCorner && edgeDist(x,y)>=2 && edgeDist(x,y)<=4){
+    const d = Math.min(x,y,size-1-x,size-1-y);
+    if(d===2 || d===3) h += 25; // 三三/小目/高目附近
+  }
+  // 对方占星位后，挂角点加分
+  for(const [cx,cy] of hoshiPts){
+    if(bd[cx][cy]===opp){
+      for(const [kx,ky] of JOSEKI.hoshi.keimaMoves(cx,cy)){
+        if(inBoard(kx,ky) && kx===x && ky===y) h += 22;
+      }
+      // 守角/夹攻点
+      for(const [rx,ry] of JOSEKI.hoshi.replies(cx,cy)){
+        if(inBoard(rx,ry) && rx===x && ry===y) h += 14;
+      }
+    }
+  }
+  // 己方占星位后，对方挂角时守角
+  for(const [cx,cy] of hoshiPts){
+    if(bd[cx][cy]===color){
+      for(const [rx,ry] of JOSEKI.hoshi.replies(cx,cy)){
+        if(inBoard(rx,ry) && rx===x && ry===y) h += 12;
+      }
+    }
+  }
+  return h;
+}
+
 // 启发式评估某空点对本色落子的价值（board-aware 版本，用于多步搜索）
-function evalPointOnBoard(bd,koPoint,x,y,color){
+function evalPointOnBoard(bd,koPoint,x,y,color, useShape=true){
   if(bd[x][y]!==0) return -1e9;
   if(koPoint && koPoint[0]===x && koPoint[1]===y) return -1e9;
   const opp = color===B ? W : B;
@@ -263,6 +409,12 @@ function evalPointOnBoard(bd,koPoint,x,y,color){
   if(totalStonesOnBoard(bd) < size){ // 开局占角偏好
     const d=Math.min(x,y,size-1-x,size-1-y);
     s += (size-1-d)*0.5;
+  }
+  if(useShape){
+    s -= badShapePenalty(bd,x,y,color);
+    s += goodShapeBonus(bd,x,y,color);
+    s += directionBonus(bd,x,y,color);
+    s += josekiHint(bd,x,y,color);
   }
   s += Math.random()*1.5;
   bd[x][y]=0;
@@ -367,7 +519,16 @@ function evaluateBoardPos(bd,color){
       oppLibs += g.libs;
     }
   }
-  return (myStones - oppStones)*8 + (myLibs - oppLibs)*3;
+  // 全局棋形/方向评估
+  let myShape=0, oppShape=0;
+  for(let x=0;x<size;x++)for(let y=0;y<size;y++){
+    if(bd[x][y]===color){
+      myShape += goodShapeBonus(bd,x,y,color) - badShapePenalty(bd,x,y,color) + directionBonus(bd,x,y,color);
+    } else if(bd[x][y]===opp){
+      oppShape += goodShapeBonus(bd,x,y,opp) - badShapePenalty(bd,x,y,opp) + directionBonus(bd,x,y,opp);
+    }
+  }
+  return (myStones - oppStones)*8 + (myLibs - oppLibs)*3 + (myShape - oppShape)*0.6;
 }
 
 function aiBestEasy(){
@@ -410,12 +571,12 @@ function aiBestHard(){
     if(s>-1e8) cands.push({x,y,s});
   }
   cands.sort((a,b)=>b.s-a.s);
-  const topCands=cands.slice(0, Math.min(18, cands.length));
+  const topCands=cands.slice(0, Math.min(24, cands.length));
   let results=[];
   for(const c of topCands){
     const r1=placeOnBoard(board,ko,c.x,c.y,aiColor);
     if(!r1) continue;
-    // 对手在下一局面会怎么走
+    // 1-ply：对手最佳应手
     const oppSaves=defenseMoves(r1.bd, opp);
     let ob=null, obs=-Infinity;
     for(let ox=0;ox<size;ox++)for(let oy=0;oy<size;oy++){
@@ -423,17 +584,29 @@ function aiBestHard(){
       const os=evalPointOnBoard(r1.bd, r1.ko, ox, oy, opp) + (oppSaves.get(ox+','+oy)||0);
       if(os>obs){ obs=os; ob={x:ox,y:oy}; }
     }
-    let finalBd=r1.bd;
+    let finalBd=r1.bd, afterOppKo=r1.ko;
     if(ob){
       const r2=placeOnBoard(r1.bd, r1.ko, ob.x, ob.y, opp);
-      if(r2) finalBd=r2.bd;
+      if(r2){ finalBd=r2.bd; afterOppKo=r2.ko; }
     }
-    const val=evaluateBoardPos(finalBd, aiColor) + c.s*0.05 + Math.random()*0.5;
+    // 2-ply：自己再应一手（用于判断后续发展潜力）
+    const mySaves2=defenseMoves(finalBd, aiColor);
+    let me2=null, me2s=-Infinity;
+    for(let mx=0;mx<size;mx++)for(let my=0;my<size;my++){
+      if(!isLegalOnBoard(finalBd, afterOppKo, mx, my, aiColor)) continue;
+      const ms=evalPointOnBoard(finalBd, afterOppKo, mx, my, aiColor) + (mySaves2.get(mx+','+my)||0);
+      if(ms>me2s){ me2s=ms; me2={x:mx,y:my}; }
+    }
+    if(me2){
+      const r3=placeOnBoard(finalBd, afterOppKo, me2.x, me2.y, aiColor);
+      if(r3) finalBd=r3.bd;
+    }
+    const val=evaluateBoardPos(finalBd, aiColor) + c.s*0.08 + Math.random()*0.5;
     results.push({x:c.x, y:c.y, val});
   }
   if(!results.length) return {best:null, bs:-Infinity};
   results.sort((a,b)=>b.val-a.val);
-  const topRes=results.slice(0, Math.min(3, results.length));
+  const topRes=results.slice(0, Math.min(4, results.length));
   const pick=topRes[Math.floor(Math.random()*topRes.length)];
   return {best:[pick.x,pick.y], bs:pick.val};
 }
