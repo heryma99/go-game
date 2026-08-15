@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>围棋 · Go</title>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--line:#2a2f3a;--txt:#e6e8ec;--muted:#8b93a1;--accent:#4f8cff;}
+*{box-sizing:border-box;}
+body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;display:flex;flex-direction:column;align-items:center;padding:16px;}
+h1{font-size:18px;margin:4px 0 12px;letter-spacing:3px;}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:center;margin-bottom:10px;}
+select,button{background:var(--panel);color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:13px;cursor:pointer;}
+button:hover{border-color:var(--accent);}
+button:active{transform:translateY(1px);}
+.status{display:flex;gap:16px;align-items:center;margin:8px 0;font-size:14px;}
+.dot{width:14px;height:14px;border-radius:50%;display:inline-block;vertical-align:-2px;margin-right:6px;border:1px solid #0003;}
+.dot.b{background:#111;}
+.dot.w{background:#fff;}
+#res{margin-top:10px;min-height:22px;color:var(--muted);text-align:center;max-width:600px;font-size:13px;}
+canvas{background:#e8b974;border-radius:6px;box-shadow:0 6px 24px #0008;touch-action:none;cursor:pointer;}
+.hint{color:var(--muted);font-size:12px;margin-top:8px;text-align:center;}
+</style>
+</head>
+<body>
+<h1>围 棋 · GO</h1>
+<div class="bar">
+  <label>模式
+    <select id="mode">
+      <option value="pvp">人人对弈</option>
+      <option value="ai">人机对战</option>
+    </select>
+  </label>
+  <label id="aiSideWrap" style="display:none">电脑执
+    <select id="aiSide">
+      <option value="W">白（你执黑先）</option>
+      <option value="B">黑（你执白后）</option>
+    </select>
+  </label>
+  <label>路数
+    <select id="size">
+      <option value="9">9 路</option>
+      <option value="13">13 路</option>
+      <option value="19" selected>19 路</option>
+    </select>
+  </label>
+  <label>让子
+    <select id="handi">
+      <option value="0">0（分先）</option>
+      <option value="2">2</option><option value="3">3</option>
+      <option value="4">4</option><option value="5">5</option>
+      <option value="6">6</option><option value="7">7</option>
+      <option value="8">8</option><option value="9">9</option>
+    </select>
+  </label>
+  <button id="new">新对局</button>
+  <button id="undo">悔棋</button>
+  <button id="pass">停一手</button>
+  <button id="score">数子终局</button>
+</div>
+<div class="status">
+  <span><span class="dot b"></span>黑提 <b id="capB">0</b></span>
+  <span><span class="dot w"></span>白提 <b id="capW">0</b></span>
+  <span>轮到：<b id="turn">黑</b></span>
+  <span id="modeLabel"></span>
+</div>
+<canvas id="board"></canvas>
+<div id="res"></div>
+<div class="hint">点击交叉点落子 · 自动提子 / 禁着 / 打劫 · 人机模式电脑自动应手 · 双方各停一手即终局数子</div>
+<script>
+const B=1, W=2;
+let size=19, board, cur, ko, history, caps, passes, handi, scored, terr;
+let mode='pvp', aiColor=W, thinking=false;
+const canvas=document.getElementById('board');
+const ctx=canvas.getContext('2d');
+const res=document.getElementById('res');
+
+function getCw(){ return Math.min(600, Math.max(280, window.innerWidth-32)); }
+
+function handiPoints(n){
+  const lo = size===9?2:3, hi = size-1-lo, mid = Math.floor(size/2);
+  const pts=[[lo,lo],[hi,lo],[lo,hi],[hi,hi],[lo,mid],[hi,mid],[mid,lo],[mid,hi],[mid,mid]];
+  return pts.slice(0,n);
+}
+
+function newGame(){
+  size=parseInt(document.getElementById('size').value);
+  handi=parseInt(document.getElementById('handi').value);
+  mode=document.getElementById('mode').value;
+  aiColor = document.getElementById('aiSide').value==='W' ? W : B;
+  board=Array.from({length:size},()=>Array(size).fill(0));
+  for(const [x,y] of handiPoints(handi)) board[x][y]=B;
+  cur = (mode==='ai') ? (handi>0 ? W : B) : (handi>0 ? W : B);
+  // 人机分先默认玩家执黑先；让子则玩家执白后行
+  if(mode==='ai' && handi===0) cur = (aiColor===W) ? B : W;
+  ko=null; history=[]; caps={1:0,2:0}; passes=0; scored=false; terr=null; thinking=false;
+  res.textContent='';
+  afterMove();
+}
+
+function neighbors(x,y){
+  const r=[];
+  if(x>0)r.push([x-1,y]);
+  if(x<size-1)r.push([x+1,y]);
+  if(y>0)r.push([x,y-1]);
+  if(y<size-1)r.push([x,y+1]);
+  return r;
+}
+
+function getGroup(x,y){
+  const color=board[x][y];
+  const seen=new Set();
+  const st=[[x,y]];
+  const group=[];
+  let libs=0;
+  while(st.length){
+    const [cx,cy]=st.pop();
+    const k=cx+','+cy;
+    if(seen.has(k))continue;
+    seen.add(k);
+    group.push([cx,cy]);
+    for(const [nx,ny] of neighbors(cx,cy)){
+      if(board[nx][ny]===0) libs++;
+      else if(board[nx][ny]===color && !seen.has(nx+','+ny)) st.push([nx,ny]);
+    }
+  }
+  return {group, libs};
+}
+
+function tryPlace(x,y){
+  if(scored) return;
+  if(board[x][y]!==0) return;
+  if(ko && ko[0]===x && ko[1]===y) return; // 打劫禁着
+  const opp = cur===B ? W : B;
+  board[x][y]=cur;
+  let removed=[];
+  for(const [nx,ny] of neighbors(x,y)){
+    if(board[nx][ny]===opp){
+      const g=getGroup(nx,ny);
+      if(g.libs===0){
+        for(const [gx,gy] of g.group){ board[gx][gy]=0; removed.push([gx,gy]); }
+      }
+    }
+  }
+  const myg=getGroup(x,y);
+  if(myg.libs===0 && removed.length===0){ board[x][y]=0; return; } // 自杀禁着
+  if(removed.length===1 && myg.libs===1) ko=[removed[0][0],removed[0][1]];
+  else ko=null;
+  caps[cur]+=removed.length;
+  history.push({board:board.map(r=>r.slice()), cur, ko:ko?ko.slice():null, caps:{...caps}, passes});
+  cur=opp; passes=0;
+  afterMove();
+}
+
+function undo(){
+  if(!history.length) return;
+  let s=history.pop();
+  board=s.board.map(r=>r.slice()); cur=s.cur; ko=s.ko?s.ko.slice():null; caps={...s.caps}; passes=s.passes;
+  if(mode==='ai'){
+    // 回退到"该玩家走"的状态：若撤完仍轮到电脑，再撤一手
+    while(history.length && cur===aiColor){
+      s=history.pop();
+      board=s.board.map(r=>r.slice()); cur=s.cur; ko=s.ko?s.ko.slice():null; caps={...s.caps}; passes=s.passes;
+    }
+  }
+  scored=false; terr=null; thinking=false;
+  res.textContent='';
+  afterMove();
+}
+
+function pass(){
+  if(scored) return;
+  history.push({board:board.map(r=>r.slice()), cur, ko:ko?ko.slice():null, caps:{...caps}, passes});
+  passes++;
+  if(passes>=2){ doScore(); return; }
+  cur = cur===B ? W : B;
+  afterMove();
+}
+
+function afterMove(){
+  draw(); updateStatus();
+  if(mode==='ai' && !scored && cur===aiColor){
+    setTimeout(aiMove, 450);
+  }
+}
+
+function updateStatus(){
+  document.getElementById('capB').textContent=caps[B];
+  document.getElementById('capW').textContent=caps[W];
+  document.getElementById('turn').textContent=cur===B?'黑':'白';
+  document.getElementById('modeLabel').textContent = mode==='ai'
+    ? ('· 人机（电脑执'+(aiColor===B?'黑':'白')+'）')
+    : '· 人人对弈';
+}
+
+function totalStones(){ let n=0; for(let x=0;x<size;x++)for(let y=0;y<size;y++) if(board[x][y]!==0) n++; return n; }
+
+function isOwnEye(x,y,color){
+  if(board[x][y]!==0) return false;
+  for(const [nx,ny] of neighbors(x,y)){ if(board[nx][ny]!==color) return false; }
+  let enemyDiag=0; const opp=color===B?W:B;
+  for(const [dx,dy] of [[1,1],[1,-1],[-1,1],[-1,-1]]){
+    const nx=x+dx, ny=y+dy;
+    if(nx<0||ny<0||nx>=size||ny>=size) continue;
+    if(board[nx][ny]===opp) enemyDiag++;
+  }
+  return enemyDiag<=1;
+}
+
+// 启发式评估某空点对本色落子的价值
+function evalPoint(x,y,color){
+  if(board[x][y]!==0) return -1e9;
+  if(ko && ko[0]===x && ko[1]===y) return -1e9;
+  const opp = color===B ? W : B;
+  board[x][y]=color;
+  let cap=0;
+  for(const [nx,ny] of neighbors(x,y)){
+    if(board[nx][ny]===opp){
+      const g=getGroup(nx,ny);
+      if(g.libs===0) cap += g.group.length;
+    }
+  }
+  const myg=getGroup(x,y);
+  const libs=myg.libs;
+  if(libs===0 && cap===0){ board[x][y]=0; return -1e9; } // 自杀
+  if(cap>0){ board[x][y]=0; return 1000 + cap*100 + libs*3; } // 优先吃子
+  if(isOwnEye(x,y,color)){ board[x][y]=0; return -350; }       // 不填自己的眼
+  let ownN=0, enN=0;
+  for(const [nx,ny] of neighbors(x,y)){
+    if(board[nx][ny]===color) ownN++;
+    else if(board[nx][ny]===opp) enN++;
+  }
+  let s = libs*3 + ownN*2 - enN*1.5;
+  if(totalStones() < size){ // 开局占角偏好
+    const d=Math.min(x,y,size-1-x,size-1-y);
+    s += (size-1-d)*0.4;
+  }
+  s += Math.random()*0.8;
+  board[x][y]=0;
+  return s;
+}
+
+function aiBest(){
+  let best=null, bs=-Infinity;
+  for(let x=0;x<size;x++)for(let y=0;y<size;y++){
+    const s=evalPoint(x,y,aiColor);
+    if(s>bs){ bs=s; best=[x,y]; }
+  }
+  return {best, bs};
+}
+
+function aiMove(){
+  if(mode!=='ai' || scored || thinking || cur!==aiColor) return;
+  thinking=true;
+  const {best,bs}=aiBest();
+  thinking=false;
+  if(best && bs>-300) tryPlace(best[0],best[1]);
+  else pass();
+}
+
+function doScore(){
+  scored=true;
+  terr=Array.from({length:size},()=>Array(size).fill(0));
+  let tB=0,tW=0,neu=0;
+  const seen=Array.from({length:size},()=>Array(size).fill(false));
+  for(let x=0;x<size;x++)for(let y=0;y<size;y++){
+    if(board[x][y]!==0||seen[x][y])continue;
+    const st=[[x,y]]; const reg=[]; let b=false,w=false; seen[x][y]=true;
+    while(st.length){
+      const [cx,cy]=st.pop(); reg.push([cx,cy]);
+      for(const [nx,ny] of neighbors(cx,cy)){
+        if(board[nx][ny]===0 && !seen[nx][ny]){ seen[nx][ny]=true; st.push([nx,ny]); }
+        else if(board[nx][ny]===B) b=true;
+        else if(board[nx][ny]===W) w=true;
+      }
+    }
+    if(b&&!w){ for(const [gx,gy] of reg) terr[gx][gy]=B; tB+=reg.length; }
+    else if(w&&!b){ for(const [gx,gy] of reg) terr[gx][gy]=W; tW+=reg.length; }
+    else neu+=reg.length;
+  }
+  let cB=0,cW=0;
+  for(let x=0;x<size;x++)for(let y=0;y<size;y++){
+    if(board[x][y]===B)cB++; else if(board[x][y]===W)cW++;
+  }
+  const black=cB+tB, white=cW+tW;
+  const komi = handi>0 ? 0 : 3.75;
+  const bAdj = black - komi;
+  let msg;
+  if(bAdj>white) msg=`黑胜 ${(bAdj-white).toFixed(2)} 子`;
+  else if(white>bAdj) msg=`白胜 ${(white-bAdj).toFixed(2)} 子`;
+  else msg=`和棋`;
+  res.textContent=
+    `终局 · ${msg}　|　黑子${cB} 黑地${tB}　白子${cW} 白地${tW}　单官${neu}　（黑贴${komi}子）`;
+  draw();
+}
+
+function starList(){
+  const s=size;
+  if(s===19) return [[3,3],[3,9],[3,15],[9,3],[9,9],[9,15],[15,3],[15,9],[15,15]];
+  if(s===13) return [[3,3],[3,9],[9,3],[9,9],[6,6]];
+  return [[2,2],[2,6],[6,2],[6,6],[4,4]];
+}
+
+function draw(){
+  const cw=getCw();
+  const dpr=window.devicePixelRatio||1;
+  canvas.style.width=cw+'px'; canvas.style.height=cw+'px';
+  canvas.width=Math.round(cw*dpr); canvas.height=Math.round(cw*dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  const pad=cw*0.045;
+  const grid=(cw-2*pad)/(size-1);
+  ctx.fillStyle='#e8b974'; ctx.fillRect(0,0,cw,cw);
+  ctx.strokeStyle='#5a3a17'; ctx.lineWidth=1;
+  for(let i=0;i<size;i++){
+    ctx.beginPath(); ctx.moveTo(pad,pad+i*grid); ctx.lineTo(cw-pad,pad+i*grid); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pad+i*grid,pad); ctx.lineTo(pad+i*grid,cw-pad); ctx.stroke();
+  }
+  ctx.fillStyle='#3a2410';
+  for(const [sx,sy] of starList()){
+    ctx.beginPath(); ctx.arc(pad+sx*grid, pad+sy*grid, grid*0.12, 0, 7); ctx.fill();
+  }
+  if(scored && terr){
+    for(let x=0;x<size;x++)for(let y=0;y<size;y++){
+      if(terr[x][y]===0) continue;
+      ctx.fillStyle = terr[x][y]===B ? '#1118' : '#fff9';
+      ctx.beginPath(); ctx.arc(pad+x*grid, pad+y*grid, grid*0.16, 0, 7); ctx.fill();
+    }
+  }
+  for(let x=0;x<size;x++)for(let y=0;y<size;y++){
+    if(board[x][y]===0) continue;
+    const px=pad+x*grid, py=pad+y*grid, r=grid*0.46;
+    const g=ctx.createRadialGradient(px-r*0.3, py-r*0.3, r*0.1, px, py, r);
+    if(board[x][y]===B){ g.addColorStop(0,'#555'); g.addColorStop(1,'#000'); }
+    else { g.addColorStop(0,'#fff'); g.addColorStop(1,'#cfcfcf'); }
+    ctx.fillStyle=g; ctx.beginPath(); ctx.arc(px,py,r,0,7); ctx.fill();
+  }
+}
+
+function syncModeUI(){
+  document.getElementById('aiSideWrap').style.display =
+    document.getElementById('mode').value==='ai' ? 'inline' : 'none';
+}
+
+canvas.addEventListener('click', e=>{
+  if(mode==='ai' && cur===aiColor) return; // 电脑回合，不响应点击
+  const rect=canvas.getBoundingClientRect();
+  const cw=getCw();
+  const mx=(e.clientX-rect.left)*(cw/rect.width);
+  const my=(e.clientY-rect.top)*(cw/rect.height);
+  const pad=cw*0.045;
+  const grid=(cw-2*pad)/(size-1);
+  const x=Math.round((mx-pad)/grid);
+  const y=Math.round((my-pad)/grid);
+  if(x<0||y<0||x>=size||y>=size) return;
+  const px=pad+x*grid, py=pad+y*grid;
+  if(Math.hypot(mx-px, my-py) > grid*0.45) return;
+  tryPlace(x,y);
+});
+
+document.getElementById('new').onclick=newGame;
+document.getElementById('undo').onclick=undo;
+document.getElementById('pass').onclick=pass;
+document.getElementById('score').onclick=doScore;
+document.getElementById('mode').onchange=()=>{ syncModeUI(); newGame(); };
+document.getElementById('aiSide').onchange=newGame;
+window.addEventListener('resize', draw);
+syncModeUI();
+newGame();
+</script>
+</body>
+</html>
