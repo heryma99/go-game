@@ -48,7 +48,13 @@ canvas{background:#e8b974;border-radius:6px;box-shadow:0 6px 24px #0008;touch-ac
     <select id="engine">
       <option value="heuristic">启发式</option>
       <option value="gnugo">GNU Go（强）</option>
+      <option value="katago">KataGo（云端·更强）</option>
     </select>
+  </label>
+  <label id="katagoWrap" style="display:none">云端 KataGo
+    <input id="katagoUrl" placeholder="https://你的后端/move" style="width:170px">
+    <input id="katagoToken" placeholder="token(可选)" style="width:80px">
+    强度<input type="range" id="katagoStrength" min="1" max="10" value="3" style="vertical-align:middle"><b id="katagoStrengthVal">3</b>s/手
   </label>
   <label>路数
     <select id="size">
@@ -119,6 +125,8 @@ function newGame(){
   res.textContent='';
   lastMove=null;
   afterMove();
+  // 选云端 KataGo 时静默预载 WASM GNU Go，作为云端不可达时的最强本地兜底（不抢提示文案）
+  if(engine==='katago') loadGnuGo(null, true);
 }
 
 function startGame(){
@@ -218,8 +226,8 @@ function afterMove(){
   draw(); updateStatus();
   if(mode==='ai' && started && !scored && cur===aiColor){
     res.textContent='电脑思考中…';
-    const fn = engine==='gnugo' ? gnugoComputerMove : aiMove;
-    const delay = engine==='gnugo' ? 550 : (aiLevel===2 ? 700 : 450);
+    const fn = engine==='gnugo' ? gnugoComputerMove : engine==='katago' ? katagoComputerMove : aiMove;
+    const delay = engine==='gnugo' ? 550 : engine==='katago' ? 500 : (aiLevel===2 ? 700 : 450);
     setTimeout(fn, delay);
   } else if(started){
     res.textContent='';
@@ -725,13 +733,13 @@ function workerCall(action, payload, timeoutMs=60000){
   });
 }
 
-function loadGnuGo(cb){
+function loadGnuGo(cb, silent){
   if(gnugoReady){ cb&&cb(true); return; }
   if(gnugoFailed){ cb&&cb(false); return; }
   gnugoWaiters.push(cb);
   if(gnugoLoading) return;
   gnugoLoading=true;
-  res.textContent='正在加载 GNU Go 引擎（约 8MB，首次需联网）…';
+  if(!silent) res.textContent='正在加载 GNU Go 引擎（约 8MB，首次需联网）…';
   makeWorker();
   // worker onmessage ready 会回调所有 waiter；给个兜底超时
   setTimeout(()=>{
@@ -790,8 +798,8 @@ function heuristicFallbackMove(){
   else pass();
 }
 
-async function gnugoComputerMove(){
-  if(mode!=='ai' || engine!=='gnugo' || scored || cur!==aiColor || !started) return;
+async function gnugoComputerMove(force){
+  if(mode!=='ai' || (engine!=='gnugo' && !force) || scored || cur!==aiColor || !started) return;
   if(gnugoFailed){ heuristicFallbackMove(); return; }
   if(!gnugoReady){ loadGnuGo(ok=>{ if(ok) gnugoComputerMove(); else heuristicFallbackMove(); }); return; }
   const thisGame = gameId;
@@ -827,6 +835,56 @@ function gnugoPass(){
   cur=(cur===B?W:B);
   res.textContent='电脑停一手';
   afterMove();
+}
+
+// 云端 KataGo 不可达时的兜底：优先用已加载的 WASM GNU Go（强于启发式），否则降级启发式。
+// 这样即使云端没起，选 KataGo 也会自动退到当前最强本地引擎，而不是退回弱算法。
+function katagoFallback(){
+  if(gnugoReady){ gnugoComputerMove(true); return; }
+  if(!gnugoFailed){ loadGnuGo(ok=>{ if(ok) gnugoComputerMove(true); else heuristicFallbackMove(); }); return; }
+  heuristicFallbackMove();
+}
+
+// 云端 KataGo：把当前棋盘状态 POST 到后端 /move，拿回 {x,y} 或 pass。
+// 后端不可达/超时 → 本手用强启发式兜底（下一手继续尝试云端，不永久切走）。
+async function katagoComputerMove(){
+  if(mode!=='ai' || engine!=='katago' || scored || cur!==aiColor || !started) return;
+  const url = (document.getElementById('katagoUrl').value||'').trim().replace(/\/+$/,'');
+  if(!url){ res.textContent='⚠️ 未填 KataGo 后端 URL，已用本地 GNU Go 兜底。'; katagoFallback(); return; }
+  const thisGame = gameId;
+  thinking=true; draw();
+  const color = aiColor===B ? 'black' : 'white';
+  const strength = parseInt(document.getElementById('katagoStrength').value||'3',10) || 3;
+  const token = (document.getElementById('katagoToken').value||'').trim();
+  const body = JSON.stringify({size, komi:komiVal(), handi, moveLog, color, strength});
+  try{
+    const headers={'Content-Type':'application/json'};
+    if(token) headers['Authorization']='Bearer '+token;
+    const ctrl=new AbortController();
+    const t=setTimeout(()=>ctrl.abort(), 60000);
+    const resp=await fetch(url+'/move', {method:'POST', headers, body, signal:ctrl.signal});
+    clearTimeout(t);
+    const data=await resp.json();
+    if(thisGame!==gameId || !started || scored) return;
+    if(data.error || (data.x===undefined && !data.pass)) throw new Error(data.error||'no move');
+    if(data.pass){
+      const dame=dameFillMove();
+      if(dame){ tryPlace(dame[0],dame[1]); }
+      else { pass(); }
+      return;
+    }
+    const bx=data.x, by=data.y;
+    tryPlace(bx, by);
+    if(board[bx][by]!==aiColor){
+      const d=dameFillMove(); if(d) tryPlace(d[0],d[1]); else pass();
+    }
+  }catch(e){
+    if(thisGame!==gameId) return;
+    res.textContent='⚠️ 云端 KataGo 不可达，本手用本地 GNU Go 兜底。';
+    katagoFallback();
+  } finally {
+    thinking=false; draw();
+  }
 }
 
 function doScore(){
@@ -934,9 +992,11 @@ function scheduleFlash(){
 
 function syncModeUI(){
   const isAi = document.getElementById('mode').value==='ai';
+  const eng = document.getElementById('engine').value;
   document.getElementById('aiSideWrap').style.display = isAi ? 'inline' : 'none';
-  document.getElementById('aiLevelWrap').style.display = isAi ? 'inline' : 'none';
+  document.getElementById('aiLevelWrap').style.display = (isAi && eng!=='katago') ? 'inline' : 'none';
   document.getElementById('engineWrap').style.display = isAi ? 'inline' : 'none';
+  document.getElementById('katagoWrap').style.display = (isAi && eng==='katago') ? 'inline' : 'none';
 }
 
 canvas.addEventListener('click', e=>{
@@ -968,6 +1028,9 @@ document.getElementById('engine').onchange=()=>{
   syncModeUI();
   if(document.getElementById('engine').value==='gnugo') loadGnuGo();
   newGame();
+};
+document.getElementById('katagoStrength').oninput=()=>{
+  document.getElementById('katagoStrengthVal').textContent=document.getElementById('katagoStrength').value;
 };
 document.getElementById('size').onchange=newGame;
 document.getElementById('handi').onchange=newGame;
