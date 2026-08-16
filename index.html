@@ -10,7 +10,7 @@
 body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.5 -apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;display:flex;flex-direction:column;align-items:center;padding:16px;}
 h1{font-size:18px;margin:4px 0 12px;letter-spacing:3px;}
 .bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:center;margin-bottom:10px;}
-select,button{background:var(--panel);color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:13px;cursor:pointer;}
+select,button,input{background:var(--panel);color:var(--txt);border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:13px;cursor:pointer;}
 button:hover{border-color:var(--accent);}
 button:active{transform:translateY(1px);}
 .status{display:flex;gap:16px;align-items:center;margin:8px 0;font-size:14px;}
@@ -20,6 +20,15 @@ button:active{transform:translateY(1px);}
 #res{margin-top:10px;min-height:22px;color:var(--muted);text-align:center;max-width:600px;font-size:13px;}
 canvas{background:#e8b974;border-radius:6px;box-shadow:0 6px 24px #0008;touch-action:none;cursor:pointer;}
 .hint{color:var(--muted);font-size:12px;margin-top:8px;text-align:center;}
+@media (max-width:560px){
+  body{padding:10px 8px;}
+  .bar{gap:10px;}
+  select,button,input{padding:11px 14px;font-size:15px;}
+  #katagoWrap{display:flex;flex-wrap:wrap;align-items:center;gap:6px;width:100%;}
+  #katagoWrap input{flex:1 1 140px;min-width:0;}
+  .hint{font-size:13px;}
+  #res{font-size:14px;}
+}
 </style>
 </head>
 <body>
@@ -98,9 +107,10 @@ let lastMove=null; // 最近一手 [x,y]，用于闪烁高亮
 let rafId=null;     // 闪烁动画循环句柄
 const canvas=document.getElementById('board');
 const ctx=canvas.getContext('2d');
+let hover=null; // 落子预览：悬停/手指所在的最近交叉点 {x,y}
 const res=document.getElementById('res');
 
-function getCw(){ return Math.min(600, Math.max(280, window.innerWidth-32)); }
+function getCw(){ return Math.min(600, Math.max(260, window.innerWidth-12)); }
 
 function handiPoints(n){
   const lo = size===9?2:3, hi = size-1-lo, mid = Math.floor(size/2);
@@ -124,6 +134,7 @@ function newGame(){
   ko=null; history=[]; caps={1:0,2:0}; passes=0;   scored=false; terr=null; thinking=false; started=false;
   res.textContent='';
   lastMove=null;
+  hover=null;
   afterMove();
   // 选云端 KataGo 时静默预载 WASM GNU Go，作为云端不可达时的最强本地兜底（不抢提示文案）
   if(engine==='katago') loadGnuGo(null, true);
@@ -965,6 +976,18 @@ function draw(){
     else { g.addColorStop(0,'#fff'); g.addColorStop(1,'#cfcfcf'); }
     ctx.fillStyle=g; ctx.beginPath(); ctx.arc(px,py,r,0,7); ctx.fill();
   }
+  // 落子预览（ghost stone）：手指/鼠标悬停在最近交叉点时显示半透明棋子 + 蓝环，避免手机端点错
+  if(hover && humanTurn() && board[hover.x] && board[hover.x][hover.y]===0){
+    const px=pad+hover.x*grid, py=pad+hover.y*grid, r=grid*0.46;
+    ctx.save();
+    ctx.globalAlpha=0.45;
+    ctx.fillStyle = cur===B ? '#000' : '#fff';
+    ctx.beginPath(); ctx.arc(px,py,r,0,7); ctx.fill();
+    ctx.globalAlpha=1;
+    ctx.lineWidth=2; ctx.strokeStyle='rgba(79,140,255,0.9)';
+    ctx.beginPath(); ctx.arc(px,py,r+2,0,7); ctx.stroke();
+    ctx.restore();
+  }
   // 最近一手闪烁高亮（红环 + 中心点），让玩家看清刚下在哪
   if(lastMove && !scored && inBoard(lastMove[0],lastMove[1]) && board[lastMove[0]][lastMove[1]]!==0){
     const [lx,ly]=lastMove;
@@ -999,22 +1022,47 @@ function syncModeUI(){
   document.getElementById('katagoWrap').style.display = (isAi && eng==='katago') ? 'inline' : 'none';
 }
 
-canvas.addEventListener('click', e=>{
-  if(!started || scored) return;
-  if(mode==='ai' && cur===aiColor) return; // 电脑回合，不响应点击
+// 是否轮到人类落子（用于落子预览与点击响应）
+function humanTurn(){
+  return started && !scored && (mode==='pvp' || cur!==aiColor);
+}
+function evtToBoard(e){
   const rect=canvas.getBoundingClientRect();
   const cw=getCw();
   const mx=(e.clientX-rect.left)*(cw/rect.width);
   const my=(e.clientY-rect.top)*(cw/rect.height);
-  const pad=cw*0.045;
-  const grid=(cw-2*pad)/(size-1);
-  const x=Math.round((mx-pad)/grid);
-  const y=Math.round((my-pad)/grid);
-  if(x<0||y<0||x>=size||y>=size) return;
-  const px=pad+x*grid, py=pad+y*grid;
-  if(Math.hypot(mx-px, my-py) > grid*0.45) return;
-  tryPlace(x,y);
+  const pad=cw*0.045, grid=(cw-2*pad)/(size-1);
+  const x=Math.round((mx-pad)/grid), y=Math.round((my-pad)/grid);
+  return {mx,my,pad,grid,x,y};
+}
+canvas.addEventListener('pointerdown', e=>{
+  if(!humanTurn()) return;
+  e.preventDefault();
+  try{ canvas.setPointerCapture(e.pointerId); }catch(_){}
+  const p=evtToBoard(e);
+  hover = (p.x>=0&&p.y>=0&&p.x<size&&p.y<size) ? {x:p.x,y:p.y} : null;
+  draw();
 });
+canvas.addEventListener('pointermove', e=>{
+  if(!humanTurn()) return;
+  const p=evtToBoard(e);
+  const nx = (p.x>=0&&p.y>=0&&p.x<size&&p.y<size) ? {x:p.x,y:p.y} : null;
+  const changed = (!!nx!==!!hover) || (nx&&hover&&(nx.x!==hover.x||nx.y!==hover.y));
+  hover=nx;
+  if(changed) draw();
+});
+canvas.addEventListener('pointerup', e=>{
+  if(!humanTurn()) return;
+  e.preventDefault();
+  const p=evtToBoard(e);
+  hover=null;
+  if(p.x<0||p.y<0||p.x>=size||p.y>=size){ draw(); return; }
+  // 放宽容差：整格范围内吸附到最近交叉点（grid*0.5），边缘 padding 内才拒
+  if(Math.hypot(p.mx-(p.pad+p.x*p.grid), p.my-(p.pad+p.y*p.grid)) > p.grid*0.5){ draw(); return; }
+  tryPlace(p.x,p.y);
+});
+canvas.addEventListener('pointercancel', ()=>{ hover=null; draw(); });
+canvas.addEventListener('pointerleave', ()=>{ if(hover){ hover=null; draw(); } });
 
 document.getElementById('start').onclick=startGame;
 document.getElementById('new').onclick=newGame;
